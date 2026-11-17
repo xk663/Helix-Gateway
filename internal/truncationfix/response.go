@@ -3,67 +3,149 @@ package truncationfix
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
 )
 
-// Complete restores an ordinary assistant message from a non-streaming response.
-func (r *Request) Complete(raw []byte) []byte {
-	if r == nil || !bytes.Contains(raw, []byte(r.name)) {
-		return raw
+var ErrInvalidResponse = errors.New("upstream response does not follow the chat completion protocol")
+
+// CheckOutput prevents the reserved transport name from escaping via alternate fields.
+func (r *Request) CheckOutput(raw []byte) error {
+	if !r.Synthetic() {
+		return nil
 	}
+	if bytes.Contains(raw, []byte(ToolName)) {
+		return ErrInvalidResponse
+	}
+	if bytes.Contains(raw, []byte("\\u")) {
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		for {
+			token, err := decoder.Token()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return ErrInvalidResponse
+			}
+			if value, ok := token.(string); ok && strings.Contains(value, ToolName) {
+				return ErrInvalidResponse
+			}
+		}
+	}
+	return nil
+}
+
+// Complete restores transport text and performs append-only repairs.
+func (r *Request) Complete(raw []byte) ([]byte, error) {
 	root := asObject(raw)
 	choices := asArray(root["choices"])
+	if len(choices) == 0 || hasValue(root["error"]) {
+		return nil, ErrInvalidResponse
+	}
 	changed := false
+	var report Report
 	for index, value := range choices {
 		choice := asObject(value)
 		message := asObject(choice["message"])
-		var kept []json.RawMessage
-		var recovered strings.Builder
-		found, incomplete := false, false
-		for _, tool := range asArray(message["tool_calls"]) {
-			fn := asObject(asObject(tool)["function"])
-			if asString(fn["name"]) != r.name {
-				kept = append(kept, tool)
-				continue
-			}
-			found = true
-			fragment := readArgument(fn["arguments"])
-			text, complete := "", false
-			if len(fragment) <= r.cfg.MaxSyntheticToolLength {
-				text, complete = extractContent(fragment, r.cfg.RepairLevel)
-			}
-			if !complete {
-				var arg arguments
-				text = arg.feed(fragment, r.cfg.MaxSyntheticToolLength)
-			}
-			if recovered.Len()+len(text) <= r.cfg.MaxSyntheticToolLength {
-				recovered.WriteString(text)
-			} else {
-				complete = false
-			}
-			incomplete = incomplete || !complete
-		}
-		if !found {
-			continue
+		if message == nil {
+			return nil, ErrInvalidResponse
 		}
 		content := asString(message["content"])
-		if recovered.Len() > 0 {
-			content = recovered.String()
+		upstreamReason := asString(choice["finish_reason"])
+		found, incomplete := false, false
+		if r.Synthetic() {
+			var kept []json.RawMessage
+			var recovered strings.Builder
+			for _, tool := range asArray(message["tool_calls"]) {
+				fn := asObject(asObject(tool)["function"])
+				if asString(fn["name"]) != r.name {
+					kept = append(kept, tool)
+					continue
+				}
+				found = true
+				fragment := readArgument(fn["arguments"])
+				text, complete := "", false
+				budget := r.cfg.MaxSyntheticToolLength - recovered.Len()
+				if len(fragment) <= budget {
+					text, complete = extractContent(fragment, r.cfg.RepairLevel)
+				}
+				if !complete {
+					var arg arguments
+					text = arg.feed(fragment, budget)
+					report.noteIncomplete(arg.overflow)
+				}
+				recovered.WriteString(text)
+				incomplete = incomplete || !complete
+			}
+			if found {
+				setCalls(message, kept)
+				content += recovered.String()
+				report.RecoveredBytes += uint64(recovered.Len())
+				rewriteFinish(choice, len(kept) > 0, incomplete)
+				changed = true
+			} else {
+				report.note("tool_unused")
+			}
 		}
-		message["content"] = encode(content + repairSuffix(content, r.cfg.RepairLevel))
-		setCalls(message, kept)
-		rewriteFinish(choice, len(kept) > 0, incomplete)
-		choice["message"] = encode(message)
+		reason := asString(choice["finish_reason"])
+		if reason == "" {
+			choice["finish_reason"] = encode("length")
+			reason, changed = "length", true
+			report.note("missing_finish_reason")
+		}
+		report.recordLength(upstreamReason, reason)
+		suffix := r.repair(content, &report)
+		if found || suffix != "" {
+			message["content"] = encode(content + suffix)
+			choice["message"] = encode(message)
+			changed = true
+		}
 		choices[index] = encode(choice)
-		changed = true
 	}
-	if !changed {
-		return raw
+	if changed {
+		root["choices"] = encode(choices)
+		raw = encode(root)
 	}
-	root["choices"] = encode(choices)
-	return encode(root)
+	if err := r.CheckOutput(raw); err != nil {
+		return nil, err
+	}
+	r.Record(report)
+	return raw, nil
+}
+
+func (report *Report) noteIncomplete(limit bool) {
+	if limit {
+		report.guard("tool_arguments_limit")
+	} else {
+		report.note("incomplete_tool_arguments")
+	}
+}
+
+func (report *Report) recordLength(upstream, downstream string) {
+	if downstream != "length" {
+		return
+	}
+	if upstream == "length" {
+		report.UpstreamLength++
+	} else {
+		report.GatewayLength++
+	}
+}
+
+func (r *Request) repair(content string, report *Report) string {
+	if len(content) > r.cfg.MaxSyntheticToolLength {
+		report.guard("repair_buffer_limit")
+		return ""
+	}
+	suffix := repairSuffix(content, r.cfg.RepairLevel)
+	if suffix != "" {
+		report.Repairs++
+	}
+	return suffix
 }
 
 func readArgument(raw json.RawMessage) string {
@@ -76,40 +158,38 @@ func readArgument(raw json.RawMessage) string {
 func setCalls(message object, genuine []json.RawMessage) {
 	if len(genuine) == 0 {
 		delete(message, "tool_calls")
-		return
+	} else {
+		message["tool_calls"] = encode(genuine)
 	}
-	message["tool_calls"] = encode(genuine)
 }
 
 func rewriteFinish(choice object, genuine, incomplete bool) {
-	reason := asString(choice["finish_reason"])
-	switch reason {
-	case "tool_calls", "function_call", "stop":
+	switch reason := asString(choice["finish_reason"]); reason {
+	case "", "tool_calls", "function_call", "stop":
 		if incomplete {
 			choice["finish_reason"] = encode("length")
-		} else if !genuine && reason != "stop" {
+		} else if !genuine && reason != "" {
 			choice["finish_reason"] = encode("stop")
 		}
 	}
 }
 
-// Stream is request-local and consumes already framed OpenAI JSON chunks.
+// Stream consumes complete SSE data payloads and keeps independent choice state.
 type Stream struct {
 	request *Request
 	choices map[int64]*choiceState
+	base    object
 }
 
 type choiceState struct {
-	synthetic         map[int64]*arguments
-	genuine           map[int64]int64
-	content           strings.Builder
-	tooLong, finished bool
+	synthetic map[int64]*arguments
+	genuine   map[int64]int64
+	content   strings.Builder
+	tooLong   bool
+	finished  bool
 }
 
 func (r *Request) Stream() *Stream {
-	if r == nil {
-		return nil
-	}
 	return &Stream{request: r, choices: make(map[int64]*choiceState)}
 }
 
@@ -118,124 +198,241 @@ func number(raw json.RawMessage) int64 {
 	return value
 }
 
-func (s *Stream) Chunk(raw []byte) []byte {
-	if s == nil || (len(s.choices) == 0 && !bytes.Contains(raw, []byte("\"tool_calls\""))) {
-		return raw
-	}
+func (s *Stream) Chunk(raw []byte) ([]byte, error) {
 	root := asObject(raw)
 	choices := asArray(root["choices"])
+	if root == nil || choices == nil || hasValue(root["error"]) {
+		return nil, ErrInvalidResponse
+	}
+	var report Report
 	changed := false
-	for index, value := range choices {
+	visible := choices[:0]
+	for _, value := range choices {
 		choice := asObject(value)
-		delta := asObject(choice["delta"])
-		if delta == nil {
-			continue
+		if choice == nil || (len(choices) > 1 && !hasValue(choice["index"])) {
+			return nil, ErrInvalidResponse
 		}
 		key := number(choice["index"])
 		state := s.choices[key]
-		calls := asArray(delta["tool_calls"])
 		if state == nil {
-			if len(calls) == 0 {
-				continue
+			if len(s.choices) >= 128 {
+				return nil, ErrInvalidResponse
 			}
-			state = &choiceState{synthetic: make(map[int64]*arguments), genuine: make(map[int64]int64)}
+			state = &choiceState{}
 			s.choices[key] = state
 		}
-		var kept []json.RawMessage
-		var text strings.Builder
-		choiceChanged := false
-		for _, tool := range calls {
-			call := asObject(tool)
-			fn := asObject(call["function"])
-			idx := number(call["index"])
-			arg := state.synthetic[idx]
-			if arg == nil && asString(fn["name"]) == s.request.name {
-				arg = &arguments{}
-				state.synthetic[idx] = arg
+		delta := asObject(choice["delta"])
+		reason := asString(choice["finish_reason"])
+		if delta == nil {
+			if reason == "" {
+				return nil, ErrInvalidResponse
 			}
-			if arg != nil {
-				text.WriteString(arg.feed(readArgument(fn["arguments"]), s.request.cfg.MaxSyntheticToolLength))
-				choiceChanged = true
+			delta = object{}
+		}
+		text, modified, err := s.transformCalls(state, delta)
+		if err != nil {
+			return nil, err
+		}
+		report.RecoveredBytes += uint64(len(text))
+		plain := asString(delta["content"])
+		if !state.finished {
+			state.record(plain, s.request.cfg)
+			state.record(text, s.request.cfg)
+		}
+		if reason != "" && !state.finished {
+			extra, incomplete := s.finishChoice(state, &report)
+			if len(state.synthetic) > 0 {
+				rewriteFinish(choice, len(state.genuine) > 0, incomplete)
+				modified = true
+			}
+			report.recordLength(reason, asString(choice["finish_reason"]))
+			text += extra
+		}
+		if text != "" {
+			delta["content"] = encode(plain + text)
+			modified = true
+		}
+		if modified {
+			changed = true
+			if len(delta) == 0 && reason == "" {
 				continue
 			}
-			// OpenAI tool indices are zero-based. Keep genuine calls contiguous
-			// when a synthetic call is removed ahead of them.
-			resolved := state.genuineIndex(idx)
-			if resolved != idx {
-				call["index"] = encode(resolved)
-				tool = encode(call)
-				choiceChanged = true
-			}
-			kept = append(kept, tool)
-		}
-		if choiceChanged {
-			setCalls(delta, kept)
-		}
-		if text.Len() > 0 {
-			state.record(text.String(), s.request.cfg)
-		}
-		if asString(choice["finish_reason"]) != "" && len(state.synthetic) > 0 && !state.finished {
-			incomplete := false
-			indices := make([]int64, 0, len(state.synthetic))
-			for idx := range state.synthetic {
-				indices = append(indices, idx)
-			}
-			slices.Sort(indices)
-			for _, idx := range indices {
-				arg := state.synthetic[idx]
-				tail, complete := arg.finish(s.request.cfg.RepairLevel)
-				text.WriteString(tail)
-				state.record(tail, s.request.cfg)
-				incomplete = incomplete || !complete
-			}
-			if !state.tooLong {
-				text.WriteString(repairSuffix(state.content.String(), s.request.cfg.RepairLevel))
-			}
-			state.finished = true
-			rewriteFinish(choice, len(state.genuine) > 0, incomplete)
-			choiceChanged = true
-		}
-		if text.Len() > 0 {
-			delta["content"] = encode(asString(delta["content"]) + text.String())
-		}
-		if choiceChanged {
 			choice["delta"] = encode(delta)
-			choices[index] = encode(choice)
-			changed = true
+			value = encode(choice)
+		}
+		visible = append(visible, value)
+	}
+	if changed {
+		root["choices"] = encode(visible)
+		raw = encode(root)
+	}
+	if err := s.request.CheckOutput(raw); err != nil {
+		return nil, err
+	}
+	if len(choices) > 0 {
+		if s.base == nil {
+			s.base = object{}
+		}
+		for _, key := range []string{"id", "object", "created", "model", "system_fingerprint", "service_tier"} {
+			if hasValue(root[key]) {
+				s.base[key] = root[key]
+			}
 		}
 	}
-	if !changed {
-		return raw
+	s.request.Record(report)
+	if changed && len(visible) == 0 && !hasValue(root["usage"]) {
+		return nil, nil
 	}
-	root["choices"] = encode(choices)
-	return encode(root)
+	return raw, nil
+}
+
+func (s *Stream) transformCalls(state *choiceState, delta object) (string, bool, error) {
+	if !s.request.Synthetic() {
+		return "", false, nil
+	}
+	calls := asArray(delta["tool_calls"])
+	if len(calls) == 0 {
+		return "", false, nil
+	}
+	if state.finished {
+		return "", false, ErrInvalidResponse
+	}
+	if state.synthetic == nil {
+		state.synthetic = make(map[int64]*arguments)
+		state.genuine = make(map[int64]int64)
+	}
+	var kept []json.RawMessage
+	var text strings.Builder
+	modified := false
+	for _, tool := range calls {
+		call := asObject(tool)
+		fn := asObject(call["function"])
+		if call == nil || (len(calls) > 1 && !hasValue(call["index"])) {
+			return "", false, ErrInvalidResponse
+		}
+		idx := number(call["index"])
+		name := asString(fn["name"])
+		if fn == nil {
+			name = asString(asObject(call["custom"])["name"])
+		}
+		arg := state.synthetic[idx]
+		_, genuine := state.genuine[idx]
+		if arg == nil && fn != nil && name == s.request.name {
+			if genuine || len(state.synthetic) >= 4 {
+				return "", false, ErrInvalidResponse
+			}
+			arg = &arguments{}
+			state.synthetic[idx] = arg
+		}
+		if arg != nil {
+			if name != "" && name != s.request.name {
+				return "", false, ErrInvalidResponse
+			}
+			text.WriteString(arg.feed(readArgument(fn["arguments"]), s.request.cfg.MaxSyntheticToolLength))
+			modified = true
+			continue
+		}
+		// A continuation must refer to a call whose name was already observed.
+		if !genuine && (name == "" || (strings.HasPrefix(s.request.name, name) && !s.request.genuine[name])) {
+			return "", false, ErrInvalidResponse
+		}
+		resolved := state.genuineIndex(idx)
+		if resolved != idx {
+			call["index"] = encode(resolved)
+			tool = encode(call)
+			modified = true
+		}
+		kept = append(kept, tool)
+	}
+	if modified {
+		setCalls(delta, kept)
+	}
+	return text.String(), modified, nil
+}
+
+func (s *Stream) finishChoice(state *choiceState, report *Report) (string, bool) {
+	var extra strings.Builder
+	incomplete := false
+	if len(state.synthetic) == 0 && s.request.Synthetic() {
+		report.note("tool_unused")
+	}
+	for _, idx := range slices.Sorted(maps.Keys(state.synthetic)) {
+		arg := state.synthetic[idx]
+		tail, complete := arg.finish(s.request.cfg.RepairLevel)
+		report.RecoveredBytes += uint64(len(tail))
+		extra.WriteString(tail)
+		state.record(tail, s.request.cfg)
+		if !complete {
+			incomplete = true
+			report.noteIncomplete(arg.overflow)
+		}
+	}
+	if !state.tooLong {
+		extra.WriteString(s.request.repair(state.content.String(), report))
+	} else {
+		report.guard("repair_buffer_limit")
+	}
+	state.finished = true
+	return extra.String(), incomplete
+}
+
+// End builds terminal choices and leaves their metrics for the downstream writer to acknowledge.
+func (s *Stream) End(failed bool) ([]byte, Report) {
+	var choices []object
+	var report Report
+	indices := slices.Sorted(maps.Keys(s.choices))
+	for _, idx := range indices {
+		state := s.choices[idx]
+		if state.finished {
+			continue
+		}
+		var extra string
+		if !failed {
+			extra, _ = s.finishChoice(state, &report)
+			report.note("missing_finish_reason")
+		}
+		state.finished = true
+		delta := object{}
+		if extra != "" {
+			delta["content"] = encode(extra)
+		}
+		choices = append(choices, object{"index": encode(idx), "delta": encode(delta), "finish_reason": encode("length")})
+	}
+	if failed && len(choices) == 0 {
+		idx := int64(0)
+		if len(indices) > 0 {
+			idx = indices[0]
+		}
+		choices = append(choices, object{"index": encode(idx), "delta": encode(object{}), "finish_reason": encode("length")})
+	}
+	if len(choices) == 0 {
+		return nil, report
+	}
+	report.GatewayLength = uint64(len(choices))
+	result := maps.Clone(s.base)
+	if result == nil {
+		result = object{"object": encode("chat.completion.chunk")}
+	}
+	result["choices"] = encode(choices)
+	return encode(result), report
 }
 
 func (s *choiceState) genuineIndex(index int64) int64 {
 	if resolved, exists := s.genuine[index]; exists {
 		return resolved
 	}
-	resolved := index
-	for syntheticIndex := range s.synthetic {
-		if syntheticIndex < index {
-			resolved--
-		}
-	}
-	for _, assigned := range s.genuine {
-		if assigned == resolved {
-			resolved = index
-			break
-		}
-	}
+	// Synthetic calls never reserve a downstream slot. Assign the next free
+	// index on first appearance and retain it through every later fragment.
+	resolved := int64(len(s.genuine))
 	s.genuine[index] = resolved
 	return resolved
 }
 
 func (s *choiceState) record(fragment string, cfg Config) {
-	if fragment == "" {
+	if fragment == "" || s.tooLong {
 		return
 	}
-	if s.tooLong || len(fragment) > cfg.MaxSyntheticToolLength-s.content.Len() {
+	if len(fragment) > cfg.MaxSyntheticToolLength-s.content.Len() {
 		s.tooLong = true
 		return
 	}

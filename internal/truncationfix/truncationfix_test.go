@@ -10,8 +10,8 @@ import (
 func newRequest(t *testing.T) *Request {
 	t.Helper()
 	raw := []byte(`{"model":"gemini-test","messages":[{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello"}],"tools":[{"type":"function","function":{"name":"lookup"}}]}`)
-	body, req := (Config{Enabled: true}).Resolve().Inject(raw)
-	if req == nil || !strings.HasPrefix(req.name, "agw_emit_") || len(req.name) != 33 {
+	body, req, _ := (Config{Enabled: true}).Resolve().Prepare(raw)
+	if req == nil || req.name != ToolName {
 		t.Fatalf("unexpected transport: %+v", req)
 	}
 	obj := asObject(body)
@@ -20,7 +20,13 @@ func newRequest(t *testing.T) *Request {
 		t.Fatal("existing tool was changed")
 	}
 	messages := asArray(obj["messages"])
-	if len(messages) != 4 || asString(asObject(messages[3])["role"]) != "user" {
+	if len(messages) != 3 {
+		t.Fatalf("Gemini prefill should add exactly one turn: %s", obj["messages"])
+	}
+	last := asObject(messages[2])
+	if asString(last["role"]) != "user" ||
+		asString(last["content"]) != "Continue from the last assistant message." ||
+		!strings.Contains(asString(asObject(messages[0])["content"]), constraint) {
 		t.Fatal("Gemini trailing turn was not normalized")
 	}
 	return req
@@ -28,10 +34,10 @@ func newRequest(t *testing.T) *Request {
 
 func TestInjectionScope(t *testing.T) {
 	a, b := newRequest(t), newRequest(t)
-	if a.name == b.name {
-		t.Fatal("transport name was reused")
+	if a.name != b.name {
+		t.Fatal("transport name changed")
 	}
-	cfg := (Config{Enabled: true, EnabledModels: []string{"*"}, DisabledModels: []string{"team/gpt-*"}}).Resolve()
+	cfg := (Config{Enabled: true, DisabledModels: []string{"team/gpt-*"}}).Resolve()
 	for _, raw := range []string{
 		`{"model":"team/gpt-test","messages":[{"role":"user","content":"Hi"}]}`,
 		`{"model":"tts-1","messages":[{"role":"user","content":"Hi"}]}`,
@@ -39,7 +45,7 @@ func TestInjectionScope(t *testing.T) {
 		`{"model":"gpt-test","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"json_schema"}}`,
 		`{"model":"gpt-test","messages":true}`,
 	} {
-		got, req := cfg.Inject([]byte(raw))
+		got, req, _ := cfg.Prepare([]byte(raw))
 		if req != nil || string(got) != raw {
 			t.Fatalf("changed ineligible request: %s", raw)
 		}
@@ -82,7 +88,13 @@ func TestStreamingSplitArguments(t *testing.T) {
 		if i == 0 {
 			name = req.name
 		}
-		result := stream.Chunk(chunk("", tool(name, fragment, 0)))
+		result := mustChunk(t, stream, chunk("", tool(name, fragment, 0)))
+		if len(result) == 0 {
+			if i == 4 {
+				t.Fatal("content was held until the end")
+			}
+			continue
+		}
 		delta := asObject(readChoice(result)["delta"])
 		if len(asArray(delta["tool_calls"])) != 0 {
 			t.Fatal("synthetic tool leaked")
@@ -93,7 +105,7 @@ func TestStreamingSplitArguments(t *testing.T) {
 		}
 		assembled.WriteString(text)
 	}
-	last := readChoice(stream.Chunk(chunk("tool_calls")))
+	last := readChoice(mustChunk(t, stream, chunk("tool_calls")))
 	assembled.WriteString(asString(asObject(last["delta"])["content"]))
 	if assembled.String() != "雪\n😃 \"quoted\"" || asString(last["finish_reason"]) != "stop" {
 		t.Fatalf("assembled %q, final choice %s", assembled.String(), encode(last))
@@ -103,7 +115,7 @@ func TestStreamingSplitArguments(t *testing.T) {
 func TestStreamingGenuineToolsAndLimits(t *testing.T) {
 	req := newRequest(t)
 	stream := req.Stream()
-	c := readChoice(stream.Chunk(chunk("", tool(req.name, "{\"content\":\"hello", 0), tool("agw_emit_not_this_request", "{}", 1))))
+	c := readChoice(mustChunk(t, stream, chunk("", tool(req.name, "{\"content\":\"hello", 0), tool("agw_emit_not_this_request", "{}", 1))))
 	delta := asObject(c["delta"])
 	genuine := asArray(delta["tool_calls"])
 	if len(genuine) != 1 || asString(asObject(asObject(genuine[0])["function"])["name"]) != "agw_emit_not_this_request" {
@@ -112,17 +124,17 @@ func TestStreamingGenuineToolsAndLimits(t *testing.T) {
 	if number(asObject(genuine[0])["index"]) != 0 {
 		t.Fatalf("index gap: %s", genuine[0])
 	}
-	c = readChoice(stream.Chunk(chunk("tool_calls", tool("", "\"}", 0))))
+	c = readChoice(mustChunk(t, stream, chunk("tool_calls", tool("", "\"}", 0))))
 	if asString(c["finish_reason"]) != "tool_calls" {
 		t.Fatal("genuine finish reason changed")
 	}
 	req.cfg.MaxSyntheticToolLength = 20
 	stream = req.Stream()
-	result := stream.Chunk(chunk("", tool(req.name, "{\"content\":\""+strings.Repeat("a", 100), 0)))
+	result := mustChunk(t, stream, chunk("", tool(req.name, "{\"content\":\""+strings.Repeat("a", 100), 0)))
 	if got := asString(asObject(readChoice(result)["delta"])["content"]); len(got) != 8 {
 		t.Fatalf("bounded recovery got %d bytes", len(got))
 	}
-	result = stream.Chunk(chunk("tool_calls"))
+	result = mustChunk(t, stream, chunk("tool_calls"))
 	if asString(readChoice(result)["finish_reason"]) != "length" {
 		t.Fatal("size cap was hidden")
 	}
@@ -130,12 +142,15 @@ func TestStreamingGenuineToolsAndLimits(t *testing.T) {
 
 func TestNonStreamingAndRepair(t *testing.T) {
 	req := newRequest(t)
-	message := object{"content": encode("preamble"), "tool_calls": encode([]object{
+	message := object{"tool_calls": encode([]object{
 		tool(req.name, "{\"content\":\"{\\\"nested\\\":[1,2\"}", 0),
 		tool("lookup", "{}", 1),
 	})}
 	normal := encode(object{"choices": encode([]object{{"message": encode(message), "finish_reason": encode("tool_calls")}}), "usage": encode(map[string]int{"total_tokens": 7})})
-	out := req.Complete(normal)
+	out, err := req.Complete(normal)
+	if err != nil {
+		t.Fatal(err)
+	}
 	answer := asObject(readChoice(out)["message"])
 	if content := asString(answer["content"]); content != "{\"nested\":[1,2]}" || !json.Valid([]byte(content)) {
 		t.Fatalf("nested JSON repair failed: %s", content)
@@ -148,5 +163,55 @@ func TestNonStreamingAndRepair(t *testing.T) {
 	}
 	if suffix := repairSuffix("<root><item>text", "aggressive"); suffix != "</item></root>" {
 		t.Fatalf("unexpected XML repair %q", suffix)
+	}
+}
+
+func mustChunk(t *testing.T, stream *Stream, raw []byte) []byte {
+	t.Helper()
+	out, err := stream.Chunk(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestOutOfOrderSyntheticAndGenuineToolIndices(t *testing.T) {
+	req := newRequest(t)
+	stream := req.Stream()
+	seen := make(map[int64][]string)
+	var recovered strings.Builder
+	frames := [][]byte{
+		chunk("", tool("lookup", "{", 7)),
+		chunk("", tool(req.name, "{\"content\":\"", 2)),
+		chunk("", tool(req.name, "{\"content\":\"甲", 0), tool("inspect", "{", 4)),
+		chunk("", tool("", "乙\"}", 2), tool("", "\"x\":1}", 7)),
+		chunk("tool_calls", tool("", "\"}", 0), tool("", "\"y\":2}", 4)),
+	}
+	for i, frame := range frames {
+		out := mustChunk(t, stream, frame)
+		if i == 1 {
+			if len(out) != 0 {
+				t.Fatalf("empty delta from hidden call: %s", out)
+			}
+			continue
+		}
+		choice := readChoice(out)
+		delta := asObject(choice["delta"])
+		recovered.WriteString(asString(delta["content"]))
+		for _, raw := range asArray(delta["tool_calls"]) {
+			call := asObject(raw)
+			name := asString(asObject(call["function"])["name"])
+			if name == req.name {
+				t.Fatalf("hidden call remains: %s", raw)
+			}
+			seen[number(call["index"])] = append(seen[number(call["index"])], asString(asObject(call["function"])["arguments"]))
+		}
+		if i == len(frames)-1 && asString(choice["finish_reason"]) != "tool_calls" {
+			t.Fatalf("genuine tool finish rewritten: %s", out)
+		}
+	}
+	if len(seen) != 2 || strings.Join(seen[0], "") != "{\"x\":1}" ||
+		strings.Join(seen[1], "") != "{\"y\":2}" || recovered.String() != "甲乙" {
+		t.Fatalf("misrouted fragments: %v, recovered %q", seen, recovered.String())
 	}
 }

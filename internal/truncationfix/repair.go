@@ -78,26 +78,49 @@ func closeJSON(text string) string {
 func openFence(text string) string {
 	var fence string
 	for line := range strings.SplitSeq(text, "\n") {
-		line = strings.TrimSuffix(line, "\r")
-		trimmed := strings.TrimLeft(line, " ")
-		if len(line)-len(trimmed) > 3 || len(trimmed) < 3 {
+		marker, rest := fencePrefix(line)
+		if marker == "" {
 			continue
 		}
-		mark := trimmed[0]
-		if mark != 96 && mark != '~' {
-			continue
-		}
-		n := 1
-		for n < len(trimmed) && trimmed[n] == mark {
-			n++
-		}
-		if n >= 3 && fence == "" {
-			fence = trimmed[:n]
-		} else if len(fence) > 0 && mark == fence[0] && n >= len(fence) && strings.TrimSpace(trimmed[n:]) == "" {
+		if fence == "" {
+			fence = marker
+		} else if strings.HasPrefix(marker, fence) && strings.TrimSpace(rest) == "" {
 			fence = ""
 		}
 	}
 	return fence
+}
+
+func stripFence(raw string) string {
+	header, body, hasLine := strings.Cut(strings.TrimSpace(raw), "\n")
+	open, _ := fencePrefix(header)
+	if !hasLine || open == "" {
+		return raw
+	}
+	body = strings.TrimRight(body, " \t\r\n")
+	if pos := strings.LastIndexByte(body, '\n'); pos >= 0 {
+		close, rest := fencePrefix(body[pos+1:])
+		if strings.HasPrefix(close, open) && strings.TrimSpace(rest) == "" {
+			body = body[:pos]
+		}
+	}
+	return strings.TrimSpace(body)
+}
+
+func fencePrefix(line string) (string, string) {
+	line = strings.TrimSuffix(line, "\r")
+	trimmed := strings.TrimLeft(line, " ")
+	if len(line)-len(trimmed) > 3 || len(trimmed) < 3 || (trimmed[0] != 96 && trimmed[0] != '~') {
+		return "", ""
+	}
+	n := 1
+	for n < len(trimmed) && trimmed[n] == trimmed[0] {
+		n++
+	}
+	if n < 3 {
+		return "", ""
+	}
+	return trimmed[:n], trimmed[n:]
 }
 
 func closeXML(text string) string {

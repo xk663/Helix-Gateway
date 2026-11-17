@@ -2,17 +2,14 @@ package truncationfix
 
 import (
 	"encoding/json"
-	"regexp"
 	"strings"
 	"unicode/utf8"
 )
 
-var contentPrefix = regexp.MustCompile("^\\s*\\{\\s*\"content\"\\s*:\\s*\"")
-
 type arguments struct {
 	raw                      strings.Builder
 	pending                  string
-	scanned                  int
+	scanner                  contentScanner
 	started, ended, overflow bool
 	emitted                  int
 }
@@ -30,18 +27,12 @@ func (a *arguments) feed(fragment string, limit int) string {
 		return ""
 	}
 	if !a.started {
-		// Canonical arguments start with the single property in the tool schema.
-		// Defer alternate shapes to the bounded full JSON parser at finish.
-		if a.raw.Len() >= 256 && a.scanned >= 256 {
-			return ""
-		}
-		a.scanned = a.raw.Len()
-		match := contentPrefix.FindStringIndex(a.raw.String())
-		if match == nil {
+		offset, found := a.scanner.contentOffset(a.raw.String())
+		if !found {
 			return ""
 		}
 		a.started = true
-		fragment = a.raw.String()[match[1]:]
+		fragment = a.raw.String()[offset:]
 	}
 	data := a.pending + fragment
 	a.pending = ""
@@ -116,12 +107,7 @@ func completeEscape(s string) int {
 
 func extractContent(raw string, repairLevel string) (string, bool) {
 	if repairLevel != "conservative" {
-		trimmed := strings.TrimSpace(raw)
-		if strings.HasPrefix(trimmed, "\x60\x60\x60") {
-			if _, rest, found := strings.Cut(trimmed, "\n"); found {
-				raw = strings.TrimSpace(strings.TrimSuffix(rest, "\x60\x60\x60"))
-			}
-		}
+		raw = stripFence(raw)
 	}
 	var value struct {
 		Content *string
