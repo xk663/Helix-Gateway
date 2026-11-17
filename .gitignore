@@ -1,0 +1,7 @@
+*.exe
+*.log
+.env
+.env.local
+/config.yaml
+/auths/
+/logs/
