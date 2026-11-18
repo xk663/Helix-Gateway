@@ -46,6 +46,7 @@ func TestToolRejectionRetriesOriginalOnce(t *testing.T) {
 		retryStatus, wantStatus, wantCalls int
 	}{
 		{"400 mentions tools", `{"error":{"message":"tools are unsupported"}}`, "", 200, 200, 2},
+		{"HTML 400 mentions tools", "<html><p>Model does not support tools</p></html>", "", 200, 502, 1},
 		{"gzip 400 mentions function calling", `{"error":{"message":"function_call is unsupported"}}`, "gzip", 400, 400, 2},
 		{"unrelated 400", `{"error":{"message":"invalid temperature"}}`, "", 200, 502, 1},
 	} {
@@ -238,7 +239,7 @@ func TestOptionsAndLegacyCompletionPath(t *testing.T) {
 			req.Header.Set("Origin", "http://localhost:8000")
 			gateway.ServeHTTP(rec, req)
 			if rec.Code != 418 || rec.Body.String() != "legacy response" ||
-				rec.Header().Get("Access-Control-Allow-Origin") != "http://localhost:8000" || calls.Load() != 1 {
+				rec.Header().Get("Access-Control-Allow-Origin") != "*" || calls.Load() != 1 {
 				t.Fatalf("legacy passthrough failed: HTTP %d %s", rec.Code, rec.Body)
 			}
 		})

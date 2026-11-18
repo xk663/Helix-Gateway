@@ -25,7 +25,7 @@ func reject(fix *truncationfix.Request, reason, message string) error {
 	return responseFailure{message: message}
 }
 
-func rewriteResponse(resp *http.Response) error {
+func rewriteResponse(resp *http.Response, transport http.RoundTripper) error {
 	fix := requestFix(resp.Request)
 	if fix == nil {
 		return nil
@@ -46,22 +46,24 @@ func rewriteResponse(resp *http.Response) error {
 		return reject(fix, "upstream_content_type", "Unsupported upstream Content-Type for a tool-wrapped response.")
 	}
 
-	switch strings.ToLower(strings.TrimSpace(strings.Join(resp.Header.Values("Content-Encoding"), ","))) {
-	case "", "identity":
-	case "gzip":
-		reader, err := gzip.NewReader(resp.Body)
-		if err != nil {
-			return reject(fix, "upstream_gzip", "Invalid upstream gzip response.")
-		}
-		resp.Body = &gzipBody{Reader: reader, upstream: resp.Body}
-	default:
+	decoded, reason := decodeBody(resp)
+	switch reason {
+	case "upstream_gzip":
+		return reject(fix, reason, "Invalid upstream gzip response.")
+	case "upstream_encoding":
 		return reject(fix, "upstream_encoding", "Unsupported upstream Content-Encoding.")
 	}
+	resp.Body = decoded
 	stripTransformedHeaders(resp, fix.Synthetic())
 	if media == "text/event-stream" {
 		body := newSSEBody(resp.Body, fix)
 		body.ctx = resp.Request.Context()
 		body.delivery = requestState(resp.Request)
+		if body.delivery != nil && body.delivery.continuation != nil {
+			body.continuation = body.delivery.continuation
+			body.continuation.bind(resp, transport, body.delivery)
+			body.stream.DeferRepair(true)
+		}
 		resp.Body = body
 		resp.ContentLength = -1
 		return nil
@@ -78,11 +80,29 @@ func rewriteResponse(resp *http.Response) error {
 	if err != nil {
 		return reject(fix, "upstream_protocol", "Unexpected upstream JSON response. The payload was withheld.")
 	}
+	if state := requestState(resp.Request); state != nil {
+		state.completed = true
+	}
 	_ = resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(result))
 	resp.ContentLength = int64(len(result))
 	resp.Header.Set("Content-Length", strconv.Itoa(len(result)))
 	return nil
+}
+
+func decodeBody(resp *http.Response) (io.ReadCloser, string) {
+	switch strings.ToLower(strings.TrimSpace(strings.Join(resp.Header.Values("Content-Encoding"), ","))) {
+	case "", "identity":
+		return resp.Body, ""
+	case "gzip":
+		reader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, "upstream_gzip"
+		}
+		return &gzipBody{Reader: reader, upstream: resp.Body}, ""
+	default:
+		return nil, "upstream_encoding"
+	}
 }
 
 type gzipBody struct {
@@ -121,16 +141,18 @@ var errEventLimit = errors.New("upstream SSE event exceeds gateway limit")
 
 type sseBody struct {
 	io.ReadCloser
-	reader      *bufio.Reader
-	fix         *truncationfix.Request
-	stream      *truncationfix.Stream
-	ctx         context.Context
-	delivery    *chatState
-	pending     []byte
-	upstreamErr error
-	seenChunk   bool
-	done        bool
-	terminal    truncationfix.Report
+	reader       *bufio.Reader
+	fix          *truncationfix.Request
+	stream       *truncationfix.Stream
+	ctx          context.Context
+	delivery     *chatState
+	pending      []byte
+	upstreamErr  error
+	seenChunk    bool
+	continuation *continuation
+	done         bool
+	completed    bool
+	terminal     truncationfix.Report
 }
 
 func newSSEBody(upstream io.ReadCloser, fix *truncationfix.Request) *sseBody {
@@ -157,6 +179,7 @@ func (body *sseBody) Read(p []byte) (int, error) {
 	body.pending = body.pending[n:]
 	if body.done && len(body.pending) == 0 && body.delivery != nil {
 		body.delivery.terminal = &body.terminal
+		body.delivery.completed = body.completed
 	}
 	return n, nil
 }
@@ -165,7 +188,7 @@ func (body *sseBody) next() []byte {
 	if body.upstreamErr != nil {
 		switch {
 		case body.upstreamErr == io.EOF && body.seenChunk:
-			return body.terminate("", true)
+			return body.finishHop(true)
 		case errors.Is(body.upstreamErr, errEventLimit):
 			return body.terminate("sse_event_limit", false)
 		case body.upstreamErr == io.EOF:
@@ -189,12 +212,30 @@ func (body *sseBody) next() []byte {
 		if !body.seenChunk {
 			return body.terminate("empty_stream", false)
 		}
-		return body.terminate("", false)
+		return body.finishHop(false)
 	}
 	if len(event) > 0 && body.upstreamErr != nil && !bytes.HasSuffix(event, []byte("\n\n")) && !bytes.HasSuffix(event, []byte("\n\r\n")) {
 		event = append(event, '\n', '\n')
 	}
 	return event
+}
+
+func (body *sseBody) finishHop(missingDone bool) []byte {
+	if body.continuation != nil && body.ctx.Err() == nil {
+		if next := body.continuation.next(body.ctx, body.fix); next != nil {
+			if missingDone {
+				body.fix.Record(truncationfix.Report{MissingDone: 1})
+			}
+			_ = body.ReadCloser.Close()
+			body.ReadCloser = next
+			body.reader.Reset(next)
+			body.stream = body.fix.RepairStream()
+			body.stream.DeferRepair(true)
+			body.seenChunk, body.upstreamErr = false, nil
+			return nil
+		}
+	}
+	return body.terminate("", missingDone)
 }
 
 func readFrame(reader *bufio.Reader) ([]byte, error) {
@@ -252,9 +293,19 @@ func (body *sseBody) rewriteEvent(wire []byte) ([]byte, bool, bool, error) {
 	if bytes.Equal(bytes.TrimSpace(raw), []byte("[DONE]")) {
 		return nil, false, true, nil
 	}
+	priorLength := body.fix.Report().UpstreamLength
 	chunk, err := body.stream.Chunk(raw)
 	if err != nil {
 		return nil, false, false, err
+	}
+	if body.continuation != nil && len(chunk) != 0 {
+		chunk, err = body.continuation.chunk(chunk, body.fix, body.fix.Report().UpstreamLength > priorLength)
+		if err != nil {
+			return nil, false, false, err
+		}
+		if body.continuation.disabled {
+			body.stream.DeferRepair(false)
+		}
 	}
 	if len(chunk) == 0 {
 		// Preserve comment heartbeats without forwarding an empty delta.
@@ -299,15 +350,24 @@ func (body *sseBody) terminate(reason string, missingDone bool) []byte {
 		}
 		buffer.WriteString("data: {\"error\":{\"message\":\"The upstream SSE response ended unexpectedly or was malformed.\",\"code\":\"upstream_stream_error\"}}\n\n")
 	}
-	if len(terminal) > 0 {
-		buffer.WriteString("data: ")
-		buffer.Write(terminal)
-		buffer.WriteString("\n\n")
+	if body.continuation != nil && !body.continuation.disabled {
+		buffer.Write(body.continuation.end(terminal, reason != "", body.fix, &report))
+	} else {
+		writeSSEData(&buffer, terminal)
 	}
 	buffer.WriteString("data: [DONE]\n\n")
 	if missingDone && reason == "" {
 		report.MissingDone++
 	}
 	body.terminal = report
+	body.completed = reason == "" && report.GatewayLength == 0
 	return buffer.Bytes()
+}
+
+func writeSSEData(buffer *bytes.Buffer, payload []byte) {
+	if len(payload) != 0 {
+		buffer.WriteString("data: ")
+		buffer.Write(payload)
+		buffer.WriteString("\n\n")
+	}
 }

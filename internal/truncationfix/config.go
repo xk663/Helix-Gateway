@@ -11,6 +11,7 @@ import (
 type Config struct {
 	Enabled                bool
 	AssumeNoTools          bool
+	AutoToolChoice         bool
 	WrapperMode            string
 	DisabledModels         []string
 	MaxSyntheticToolLength int
@@ -21,6 +22,11 @@ type Config struct {
 func (cfg Config) Resolve() Config {
 	cfg.Enabled = env("ENABLED", cfg.Enabled, strconv.ParseBool)
 	cfg.AssumeNoTools = env("ASSUME_NO_TOOLS", cfg.AssumeNoTools, strconv.ParseBool)
+	if forced, ok := os.LookupEnv("TRUNCATIONFIX_FORCE_TOOL_CHOICE"); ok {
+		if value, err := strconv.ParseBool(strings.TrimSpace(forced)); err == nil {
+			cfg.AutoToolChoice = !value
+		}
+	}
 	cfg.WrapperMode = env("WRAPPER_MODE", cfg.WrapperMode, identity)
 	cfg.RepairLevel = env("REPAIR_LEVEL", cfg.RepairLevel, identity)
 	cfg.DisabledModels = env("DISABLED_MODELS", cfg.DisabledModels, splitModels)
@@ -29,7 +35,7 @@ func (cfg Config) Resolve() Config {
 	switch cfg.WrapperMode {
 	case "":
 		cfg.WrapperMode = "synthetic"
-	case "synthetic", "repair-only", "aggressive", "off":
+	case "adaptive", "synthetic", "repair-only", "aggressive", "off":
 	default:
 		cfg.WrapperMode = "off"
 	}

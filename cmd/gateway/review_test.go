@@ -53,13 +53,14 @@ func TestOffPreservesUpstreamCORSAndVary(t *testing.T) {
 func TestExplicitToolRejection(t *testing.T) {
 	cases := map[string]bool{
 		`{"error":{"code":"unsupported_capability","param":"tools"}}`:                                    true,
-		"unsupported capability: tools":                                                                  true,
+		"unsupported capability: tools":                                                                  false,
+		"<html><p>Model does not support tools.</p></html>":                                              false,
 		"Unknown parameter: 'tools[0].function'":                                                         false,
-		"Model does not support tools.":                                                                  true,
-		"Tool calling is not supported by this model":                                                    true,
-		"Function calling unsupported":                                                                   true,
-		"Unrecognized request argument supplied: 'tools'":                                                true,
-		"Unrecognized request argument: 'tools'":                                                         true,
+		"Model does not support tools.":                                                                  false,
+		`{"message":"Tool calling is not supported by this model"}`:                                      true,
+		`{"message":"Function calling unsupported"}`:                                                     true,
+		`{"message":"Unrecognized request argument supplied: 'tools'"}`:                                  true,
+		`{"message":"Unrecognized request argument: 'tools'"}`:                                           true,
 		"invalid function arguments":                                                                     false,
 		"tool_choice is not supported":                                                                   false,
 		"function 'x' not found":                                                                         false,
@@ -93,7 +94,7 @@ func TestToolErrorProbeRestoresRawBody(t *testing.T) {
 	identity := []byte(`{"error":{"message":"invalid function arguments"}}`)
 	var compressed bytes.Buffer
 	zip := gzip.NewWriter(&compressed)
-	_, _ = zip.Write([]byte("Model does not support tools"))
+	_, _ = zip.Write([]byte(`{"message":"Model does not support tools"}`))
 	if err := zip.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +111,7 @@ func TestToolErrorProbeRestoresRawBody(t *testing.T) {
 		upstream := &closeTracker{Reader: bytes.NewReader(tc.wire)}
 		response := &http.Response{Header: make(http.Header), Body: upstream}
 		response.Header.Set("Content-Encoding", tc.encoding)
-		if found := toolRejection(response); found != tc.match {
+		if found := explicitToolRejection(readRejectionBody(response)); found != tc.match {
 			t.Fatalf("probe returned %v, wanted %v", found, tc.match)
 		}
 		got, err := io.ReadAll(response.Body)

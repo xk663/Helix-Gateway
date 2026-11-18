@@ -150,8 +150,20 @@ func FuzzChunk(f *testing.F) {
 		if !bytes.Equal(whole, split) {
 			t.Fatalf("SSE output depends on transport fragmentation")
 		}
-		if bytes.Contains(split, []byte(truncationfix.ToolName)) || !bytes.HasSuffix(split, []byte("data: [DONE]\n\n")) {
-			t.Fatalf("unsafe or unterminated SSE: %q", split)
+		if !bytes.HasSuffix(split, []byte("data: [DONE]\n\n")) {
+			t.Fatalf("unterminated SSE: %q", split)
+		}
+		_, fix, _ := (truncationfix.Config{Enabled: true, WrapperMode: "synthetic"}).Resolve().Prepare([]byte(chatRequest))
+		for _, event := range bytes.Split(bytes.ReplaceAll(split, []byte("\r\n"), []byte("\n")), []byte("\n\n")) {
+			var payload [][]byte
+			for _, line := range bytes.Split(event, []byte("\n")) {
+				if data, ok := bytes.CutPrefix(line, []byte("data:")); ok {
+					payload = append(payload, bytes.TrimPrefix(data, []byte(" ")))
+				}
+			}
+			if raw := bytes.Join(payload, []byte("\n")); fix.CheckOutput(raw) != nil {
+				t.Fatalf("reserved tool metadata escaped: %q", event)
+			}
 		}
 	})
 }

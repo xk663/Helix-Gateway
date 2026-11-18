@@ -58,22 +58,26 @@ type Request struct {
 	name    string
 	cfg     Config
 	genuine map[string]bool
+	forced  bool
 	report  Report
 }
 
 type Report struct {
-	RecoveredBytes uint64
-	UpstreamLength uint64
-	GatewayLength  uint64
-	GuardTrips     uint64
-	Repairs        uint64
-	MissingDone    uint64
-	Reasons        map[string]uint64
+	RecoveredBytes    uint64
+	UpstreamLength    uint64
+	GatewayLength     uint64
+	GuardTrips        uint64
+	DeduplicatedBytes uint64
+	ToolHits          uint64
+	Repairs           uint64
+	MissingDone       uint64
+	Reasons           map[string]uint64
 }
 
-func (r *Request) BufferSize() int { return r.cfg.StreamBufferSize }
-func (r *Request) Synthetic() bool { return r.name != "" }
-func (r *Request) Report() Report  { return r.report }
+func (r *Request) BufferSize() int  { return r.cfg.StreamBufferSize }
+func (r *Request) Synthetic() bool  { return r.name != "" }
+func (r *Request) ForcedTool() bool { return r.forced }
+func (r *Request) Report() Report   { return r.report }
 
 func (r *Request) Note(reason string) {
 	r.report.note(reason)
@@ -100,6 +104,8 @@ func (r *Request) Record(report Report) {
 	r.report.UpstreamLength += report.UpstreamLength
 	r.report.GatewayLength += report.GatewayLength
 	r.report.GuardTrips += report.GuardTrips
+	r.report.DeduplicatedBytes += report.DeduplicatedBytes
+	r.report.ToolHits += report.ToolHits
 	r.report.Repairs += report.Repairs
 	r.report.MissingDone += report.MissingDone
 	if len(report.Reasons) > 0 && r.report.Reasons == nil {
@@ -166,8 +172,14 @@ func (cfg Config) Prepare(raw []byte) ([]byte, *Request, string) {
 	}
 	body["tools"] = encode(append(tools, transportTool))
 	body["tool_choice"] = encode("auto")
+	forced := len(tools) == 0 && !cfg.AutoToolChoice
+	if forced {
+		body["tool_choice"] = encode(map[string]any{
+			"type": "function", "function": map[string]string{"name": ToolName},
+		})
+	}
 	body["messages"] = encode(messages)
-	return encode(body), &Request{name: ToolName, cfg: cfg, genuine: genuine}, ""
+	return encode(body), &Request{name: ToolName, cfg: cfg, genuine: genuine, forced: forced}, ""
 }
 
 func constrainMessages(messages []json.RawMessage, model string) ([]json.RawMessage, bool) {

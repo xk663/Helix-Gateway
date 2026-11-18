@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"io"
 	"maps"
 	"slices"
 	"strconv"
@@ -18,25 +17,47 @@ func (r *Request) CheckOutput(raw []byte) error {
 	if !r.Synthetic() {
 		return nil
 	}
-	if bytes.Contains(raw, []byte(ToolName)) {
+	if !bytes.Contains(raw, []byte(ToolName)) && !bytes.Contains(raw, []byte("\\u")) {
+		return nil
+	}
+	var structure any
+	if json.Unmarshal(raw, &structure) != nil || hasReservedTool(structure, false) {
 		return ErrInvalidResponse
 	}
-	if bytes.Contains(raw, []byte("\\u")) {
-		decoder := json.NewDecoder(bytes.NewReader(raw))
-		for {
-			token, err := decoder.Token()
-			if err == io.EOF {
-				break
+	return nil
+}
+
+func hasReservedTool(value any, toolField bool) bool {
+	switch node := value.(type) {
+	case string:
+		return toolField && node == ToolName
+	case map[string]any:
+		if name, _ := node["name"].(string); name == ToolName {
+			kind, _ := node["type"].(string)
+			if toolField || kind == "function" || kind == "tool_use" || kind == "custom" {
+				return true
 			}
-			if err != nil {
-				return ErrInvalidResponse
+		}
+		for key, child := range node {
+			switch key {
+			case "function", "function_call", "custom", "tool_calls", "tools", "tool_choice":
+				if hasReservedTool(child, true) {
+					return true
+				}
+			default:
+				if hasReservedTool(child, false) {
+					return true
+				}
 			}
-			if value, ok := token.(string); ok && strings.Contains(value, ToolName) {
-				return ErrInvalidResponse
+		}
+	case []any:
+		for _, child := range node {
+			if hasReservedTool(child, toolField) {
+				return true
 			}
 		}
 	}
-	return nil
+	return false
 }
 
 // Complete restores transport text and performs append-only repairs.
@@ -82,9 +103,13 @@ func (r *Request) Complete(raw []byte) ([]byte, error) {
 				incomplete = incomplete || !complete
 			}
 			if found {
+				report.ToolHits++
 				setCalls(message, kept)
-				content += recovered.String()
-				report.RecoveredBytes += uint64(recovered.Len())
+				var overlap TextOverlap
+				text, cut := overlap.Merge(content, recovered.String(), true)
+				content += text
+				report.RecoveredBytes += uint64(len(text))
+				report.DeduplicatedBytes += uint64(cut)
 				rewriteFinish(choice, len(kept) > 0, incomplete)
 				changed = true
 			} else {
@@ -176,15 +201,17 @@ func rewriteFinish(choice object, genuine, incomplete bool) {
 
 // Stream consumes complete SSE data payloads and keeps independent choice state.
 type Stream struct {
-	request *Request
-	choices map[int64]*choiceState
-	base    object
+	request     *Request
+	choices     map[int64]*choiceState
+	base        object
+	deferRepair bool
 }
 
 type choiceState struct {
 	synthetic map[int64]*arguments
 	genuine   map[int64]int64
 	content   strings.Builder
+	overlap   TextOverlap
 	tooLong   bool
 	finished  bool
 }
@@ -192,6 +219,19 @@ type choiceState struct {
 func (r *Request) Stream() *Stream {
 	return &Stream{request: r, choices: make(map[int64]*choiceState)}
 }
+
+func (r *Request) RepairStream() *Stream {
+	return (&Request{cfg: r.cfg}).Stream()
+}
+
+func (s *Stream) DeferRepair(deferRepair bool) { s.deferRepair = deferRepair }
+
+func (r *Request) RepairText(text string) (string, Report) {
+	var report Report
+	return r.repair(text, &report), report
+}
+
+func (r *Request) HasClientTools() bool { return len(r.genuine) != 0 }
 
 func number(raw json.RawMessage) int64 {
 	value, _ := strconv.ParseInt(string(raw), 10, 64)
@@ -233,10 +273,15 @@ func (s *Stream) Chunk(raw []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		report.RecoveredBytes += uint64(len(text))
 		plain := asString(delta["content"])
+		var before string
 		if !state.finished {
+			if plain != "" && len(state.overlap.pending) != 0 {
+				before = state.mergeSynthetic("", true, &report)
+				state.record(before, s.request.cfg)
+			}
 			state.record(plain, s.request.cfg)
+			text = state.mergeSynthetic(text, false, &report)
 			state.record(text, s.request.cfg)
 		}
 		if reason != "" && !state.finished {
@@ -248,8 +293,8 @@ func (s *Stream) Chunk(raw []byte) ([]byte, error) {
 			report.recordLength(reason, asString(choice["finish_reason"]))
 			text += extra
 		}
-		if text != "" {
-			delta["content"] = encode(plain + text)
+		if text != "" || before != "" {
+			delta["content"] = encode(before + plain + text)
 			modified = true
 		}
 		if modified {
@@ -355,24 +400,31 @@ func (s *Stream) finishChoice(state *choiceState, report *Report) (string, bool)
 	incomplete := false
 	if len(state.synthetic) == 0 && s.request.Synthetic() {
 		report.note("tool_unused")
+	} else if len(state.synthetic) > 0 {
+		report.ToolHits++
 	}
 	for _, idx := range slices.Sorted(maps.Keys(state.synthetic)) {
 		arg := state.synthetic[idx]
 		tail, complete := arg.finish(s.request.cfg.RepairLevel)
-		report.RecoveredBytes += uint64(len(tail))
 		extra.WriteString(tail)
-		state.record(tail, s.request.cfg)
 		if !complete {
 			incomplete = true
 			report.noteIncomplete(arg.overflow)
 		}
+	}
+	text := state.mergeSynthetic(extra.String(), true, report)
+	state.record(text, s.request.cfg)
+	extra.Reset()
+	extra.WriteString(text)
+	state.finished = true
+	if s.deferRepair {
+		return extra.String(), incomplete
 	}
 	if !state.tooLong {
 		extra.WriteString(s.request.repair(state.content.String(), report))
 	} else {
 		report.guard("repair_buffer_limit")
 	}
-	state.finished = true
 	return extra.String(), incomplete
 }
 

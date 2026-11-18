@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -15,7 +16,7 @@ import (
 
 const (
 	toolErrorLimit = 64 << 10
-	retryCacheTTL  = 2 * time.Minute
+	retryCacheTTL  = 10 * time.Minute
 	retryCacheSize = 256
 )
 
@@ -39,6 +40,30 @@ func makeRetryKey(req *http.Request, original []byte) retryKey {
 	var key retryKey
 	hash.Sum(key[:0])
 	return key
+}
+
+func makeModelKey(target *url.URL, req *http.Request, model string) retryKey {
+	hash := sha256.New()
+	for _, value := range []string{target.String(), model, req.URL.RawQuery} {
+		_, _ = io.WriteString(hash, value)
+		_, _ = hash.Write([]byte{0})
+	}
+	for _, name := range []string{"Authorization", "X-API-Key", "Api-Key", "Cookie",
+		"OpenAI-Organization", "OpenAI-Project"} {
+		_, _ = io.WriteString(hash, name)
+		_, _ = hash.Write([]byte{0})
+		for _, value := range req.Header.Values(name) {
+			_, _ = io.WriteString(hash, value)
+			_, _ = hash.Write([]byte{0})
+		}
+	}
+	var key retryKey
+	hash.Sum(key[:0])
+	return key
+}
+
+func forceKey(model retryKey) retryKey {
+	return sha256.Sum256(append(model[:], 1))
 }
 
 type toolRetryCache struct {
@@ -81,42 +106,72 @@ func (c *toolRetryCache) remember(key retryKey, now time.Time) {
 type toolFallbackTransport struct {
 	upstream http.RoundTripper
 	cache    *toolRetryCache
+	policy   *tokenPolicy
 }
 
 func (t toolFallbackTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	resp, err := t.upstream.RoundTrip(req)
 	state := requestState(req)
-	if state == nil || !state.fix.Synthetic() {
+	if state != nil {
+		state.upstreamCalls++
+	}
+	resp, err := t.upstream.RoundTrip(req)
+	if state == nil || state.fix == nil {
 		return resp, err
 	}
 	defer func() {
 		state.original = nil
+		state.forcedPayload = nil
 		state.acceptEncoding = nil
 	}()
-	if err != nil || state.retried ||
+	if err != nil ||
 		resp.StatusCode != http.StatusBadRequest || req.Context().Err() != nil {
 		return resp, err
 	}
-	if !toolRejection(resp) || req.Context().Err() != nil {
+	detail, ok := parseRejection(readRejectionBody(resp))
+	if ok && t.policy != nil {
+		t.policy.reject(state.modelKey, state.clientCap, state.sentCap, detail)
+	}
+	if !state.fix.Synthetic() || !ok || req.Context().Err() != nil {
+		return resp, nil
+	}
+	withoutTools := detail.toolsRejected()
+	automaticChoice := !withoutTools && state.fix.ForcedTool() &&
+		len(state.forcedPayload) > 0 && detail.forcedChoiceRejected()
+	if (!withoutTools && !automaticChoice) || req.Context().Err() != nil {
 		return resp, nil
 	}
 	_ = resp.Body.Close()
-	state.retried = true
-	state.fix.Note("upstream_rejected_tools")
 
 	retry := req.Clone(req.Context())
-	retry.Body = io.NopCloser(bytes.NewReader(state.original))
+	retryBody := state.original
+	if automaticChoice {
+		retryBody = replaceChatField(state.forcedPayload, "tool_choice", json.RawMessage(`"auto"`))
+		state.fix.Note("upstream_rejected_forced_choice")
+		if t.cache != nil {
+			t.cache.remember(state.forcedKey, time.Now())
+		}
+	} else {
+		state.passthrough = true
+		state.fix.Note("upstream_rejected_tools")
+		retry.Header.Del("Accept-Encoding")
+		for _, value := range state.acceptEncoding {
+			retry.Header.Add("Accept-Encoding", value)
+		}
+	}
+	retry.Body = io.NopCloser(bytes.NewReader(retryBody))
 	retry.GetBody = nil
-	retry.ContentLength = int64(len(state.original))
+	retry.ContentLength = int64(len(retryBody))
 	retry.TransferEncoding = nil
 	retry.Header.Del("Content-Length")
-	retry.Header.Del("Accept-Encoding")
-	for _, value := range state.acceptEncoding {
-		retry.Header.Add("Accept-Encoding", value)
-	}
+	state.upstreamCalls++
 	resp, err = t.upstream.RoundTrip(retry)
-	if err == nil && resp.StatusCode == http.StatusBadRequest && t.cache != nil {
-		t.cache.remember(state.retryKey, time.Now())
+	if err == nil && t.cache != nil && withoutTools {
+		switch {
+		case resp.StatusCode >= 200 && resp.StatusCode < 300:
+			t.cache.remember(state.modelKey, time.Now())
+		case resp.StatusCode == http.StatusBadRequest:
+			t.cache.remember(state.retryKey, time.Now())
+		}
 	}
 	return resp, err
 }
@@ -126,70 +181,81 @@ type replayBody struct {
 	io.Closer
 }
 
-// toolRejection probes bounded wire bytes and restores them along with the
+// readRejectionBody probes bounded wire bytes and restores them along with the
 // original closer. Decompression operates on the copy, not the upstream body.
-func toolRejection(resp *http.Response) bool {
+func readRejectionBody(resp *http.Response) []byte {
 	encoding := strings.ToLower(strings.TrimSpace(strings.Join(resp.Header.Values("Content-Encoding"), ",")))
 	if encoding != "" && encoding != "identity" && encoding != "gzip" {
-		return false
+		return nil
 	}
 	original := resp.Body
 	wire, err := io.ReadAll(io.LimitReader(original, toolErrorLimit+1))
 	resp.Body = replayBody{Reader: io.MultiReader(bytes.NewReader(wire), original), Closer: original}
 	if err != nil || len(wire) > toolErrorLimit {
-		return false
+		return nil
 	}
 	body := wire
 	if encoding == "gzip" {
 		decoded, err := gzip.NewReader(bytes.NewReader(wire))
 		if err != nil {
-			return false
+			return nil
 		}
 		defer decoded.Close()
 		body, err = io.ReadAll(io.LimitReader(decoded, toolErrorLimit+1))
 		if err != nil || len(body) > toolErrorLimit {
-			return false
+			return nil
 		}
 	}
-	return explicitToolRejection(body)
+	return body
 }
 
 func explicitToolRejection(body []byte) bool {
-	if !json.Valid(body) {
-		return messageRejectsTools(string(body))
-	}
-	type detail struct {
-		Message string
-		Code    json.RawMessage
-		Param   string
-	}
+	detail, ok := parseRejection(body)
+	return ok && detail.toolsRejected()
+}
+
+type rejectionDetail struct {
+	Message string
+	Code    json.RawMessage
+	Param   string
+}
+
+func parseRejection(body []byte) (rejectionDetail, bool) {
 	var envelope struct {
-		detail
+		rejectionDetail
 		Error json.RawMessage
 	}
 	if json.Unmarshal(body, &envelope) != nil {
-		return false
+		return rejectionDetail{}, false
 	}
 	if len(envelope.Error) > 0 {
 		var message string
 		if json.Unmarshal(envelope.Error, &message) == nil {
 			envelope.Message = message
 		} else {
-			var nested detail
+			var nested rejectionDetail
 			if json.Unmarshal(envelope.Error, &nested) != nil {
-				return false
+				return rejectionDetail{}, false
 			}
-			envelope.detail = nested
+			envelope.rejectionDetail = nested
 		}
 	}
 
-	param := strings.ToLower(strings.TrimSpace(envelope.Param))
+	return envelope.rejectionDetail, true
+}
+
+func (d rejectionDetail) code() string {
+	var code string
+	_ = json.Unmarshal(d.Code, &code)
+	return strings.ToLower(code)
+}
+
+func (d rejectionDetail) toolsRejected() bool {
+	param := strings.ToLower(strings.TrimSpace(d.Param))
 	if param != "" && param != "tools" {
 		return false
 	}
-	var code string
-	_ = json.Unmarshal(envelope.Code, &code)
-	switch strings.ToLower(code) {
+	switch d.code() {
 	case "unsupported_tools", "tools_not_supported", "tool_calling_not_supported",
 		"unsupported_tool_calling", "unsupported_function_calling", "function_calling_not_supported":
 		return true
@@ -200,7 +266,17 @@ func explicitToolRejection(body []byte) bool {
 	case "invalid_function_arguments", "invalid_tool_arguments", "tool_not_found", "function_not_found", "invalid_tool_choice":
 		return false
 	}
-	return messageRejectsTools(envelope.Message)
+	return messageRejectsTools(d.Message)
+}
+
+var refusedChoice = regexp.MustCompile("(?i)\\btool[_ -]choice\\b\\s+(?:is\\s+)?(?:not supported|unsupported)\\b")
+
+func (d rejectionDetail) forcedChoiceRejected() bool {
+	param := strings.ToLower(strings.TrimSpace(d.Param))
+	if param != "" && param != "tool_choice" {
+		return false
+	}
+	return (param == "tool_choice" && d.code() == "unsupported_parameter") || refusedChoice.MatchString(d.Message)
 }
 
 func messageRejectsTools(message string) bool {

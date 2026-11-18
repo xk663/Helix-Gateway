@@ -29,12 +29,24 @@ const (
 type requestKey struct{}
 
 type chatState struct {
-	fix            *truncationfix.Request
-	original       []byte
-	acceptEncoding []string
-	retryKey       retryKey
-	retried        bool
-	terminal       *truncationfix.Report
+	fix              *truncationfix.Request
+	model            string
+	modelKey         retryKey
+	forcedKey        retryKey
+	clientCap        int
+	sentCap          int
+	upstreamCalls    uint64
+	completed        bool
+	observed         bool
+	learnMode        bool
+	continuation     *continuation
+	continuationHops uint64
+	original         []byte
+	forcedPayload    []byte
+	acceptEncoding   []string
+	retryKey         retryKey
+	passthrough      bool
+	terminal         *truncationfix.Report
 }
 
 type deliveryWriter struct {
@@ -72,7 +84,7 @@ func main() {
 		target.User != nil || target.ForceQuery || target.RawQuery != "" || target.Fragment != "" {
 		log.Fatal("upstream must be an HTTP(S) base URL without credentials, query or fragment")
 	}
-	cfg := truncationfix.Config{Enabled: true}.Resolve()
+	cfg := truncationfix.Config{Enabled: true, WrapperMode: "adaptive"}.Resolve()
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(*port))
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -89,6 +101,9 @@ func main() {
 func newGateway(target *url.URL, cfg truncationfix.Config) http.Handler {
 	stats := &gatewayStats{}
 	cache := &toolRetryCache{entries: make(map[retryKey]time.Time)}
+	policy := &tokenPolicy{models: make(map[retryKey]tokenPolicyEntry), ceiling: configuredTokenCeiling()}
+	modes := &adaptivePolicy{models: make(map[retryKey]adaptiveModel)}
+	continueConfig := configuredContinuation()
 	base := strings.TrimRight(target.EscapedPath(), "/")
 	if base == "" {
 		base = "/v1"
@@ -101,7 +116,7 @@ func newGateway(target *url.URL, cfg truncationfix.Config) http.Handler {
 		transport = clone
 	}
 	proxy := &httputil.ReverseProxy{
-		Transport: toolFallbackTransport{upstream: transport, cache: cache},
+		Transport: toolFallbackTransport{upstream: transport, cache: cache, policy: policy},
 		Rewrite: func(p *httputil.ProxyRequest) {
 			p.Out.URL.Scheme = target.Scheme
 			p.Out.URL.Host = target.Host
@@ -112,10 +127,10 @@ func newGateway(target *url.URL, cfg truncationfix.Config) http.Handler {
 			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			if err := rewriteResponse(resp); err != nil {
+			if err := rewriteResponse(resp, transport); err != nil {
 				return err
 			}
-			if cfg.Enabled && cfg.WrapperMode != "repair-only" {
+			if fix := requestFix(resp.Request); fix != nil && fix.Synthetic() {
 				setLoopbackCORS(resp.Header, resp.Request.Header.Get("Origin"))
 			}
 			return nil
@@ -124,7 +139,7 @@ func newGateway(target *url.URL, cfg truncationfix.Config) http.Handler {
 			if r.Context().Err() != nil {
 				return
 			}
-			if cfg.Enabled {
+			if fix := requestFix(r); fix != nil && fix.Synthetic() {
 				setLoopbackCORS(w.Header(), r.Header.Get("Origin"))
 			}
 			var failure responseFailure
@@ -132,7 +147,7 @@ func newGateway(target *url.URL, cfg truncationfix.Config) http.Handler {
 				writeError(w, http.StatusBadGateway, failure.message)
 				return
 			}
-			if state := requestState(r); state != nil {
+			if state := requestState(r); state != nil && state.fix != nil {
 				state.fix.Note("upstream_transport")
 			}
 			writeError(w, http.StatusBadGateway, "The upstream API response could not be read.")
@@ -152,9 +167,7 @@ func newGateway(target *url.URL, cfg truncationfix.Config) http.Handler {
 		}
 		stats.serve(w, r)
 	})
-	mux.Handle("GET /v1/models", proxy)
-	mux.Handle("POST /v1/completions", proxy)
-	mux.Handle("POST /v1/embeddings", proxy)
+	mux.Handle("/v1/", proxy)
 	for path, method := range map[string]string{
 		"/v1/models": "GET", "/v1/chat/completions": "POST", "/v1/completions": "POST",
 		"/v1/embeddings": "POST",
@@ -179,18 +192,28 @@ func newGateway(target *url.URL, cfg truncationfix.Config) http.Handler {
 		})
 	}
 	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
-		var state *chatState
+		state := &chatState{}
 		writer, tracksDelivery := w.(*deliveryWriter)
 		reason := "disabled"
 		defer func() {
-			var fix *truncationfix.Request
-			if state != nil {
-				fix = state.fix
+			fix := state.fix
+			if fix != nil {
 				if state.terminal != nil && tracksDelivery && !writer.failed.Load() && r.Context().Err() == nil {
 					fix.Record(*state.terminal)
 				}
+				if state.completed && tracksDelivery && !writer.failed.Load() && r.Context().Err() == nil {
+					report := fix.Report()
+					state.observed = true
+					policy.observe(state.modelKey, state.sentCap, report.UpstreamLength > 0)
+					if state.learnMode && !fix.HasClientTools() {
+						unused := report.ToolHits == 0 && report.Reasons["tool_unused"] > 0
+						if transition := modes.observe(state.modelKey, fix.Synthetic(), report.UpstreamLength > 0, unused); transition != "" {
+							fix.Note(transition)
+						}
+					}
+				}
 			}
-			stats.record(fix, reason)
+			stats.record(state, reason)
 		}()
 		if cfg.Enabled {
 			raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
@@ -207,26 +230,68 @@ func newGateway(target *url.URL, cfg truncationfix.Config) http.Handler {
 				return
 			}
 			original := raw
+			var params chatParameters
+			_ = json.Unmarshal(original, &params)
+			state.model = params.Model
+			field, budget := params.cap()
+			state.clientCap, state.sentCap = budget, budget
+			state.modelKey = makeModelKey(target, r, params.Model)
 			var fix *truncationfix.Request
-			raw, fix, reason = cfg.Prepare(raw)
-			var key retryKey
-			if fix != nil && fix.Synthetic() {
-				key = makeRetryKey(r, original)
-				if cache.contains(key, time.Now()) {
-					raw, fix, reason = original, nil, "upstream_tool_retry_suppressed"
+			requestConfig := cfg
+			if cfg.WrapperMode == "adaptive" {
+				requestConfig.WrapperMode = "repair-only"
+				if !cfg.AssumeNoTools && modes.synthetic(state.modelKey) {
+					requestConfig.WrapperMode = "synthetic"
 				}
 			}
+			state.forcedKey = forceKey(state.modelKey)
+			now := time.Now()
+			cachedAuto := cache.contains(state.forcedKey, now)
+			requestConfig.AutoToolChoice = requestConfig.AutoToolChoice || cachedAuto
+			raw, fix, reason = requestConfig.Prepare(raw)
+			state.learnMode = cfg.WrapperMode == "adaptive" && !cfg.AssumeNoTools
+			if fix == nil && cfg.WrapperMode == "adaptive" && requestConfig.WrapperMode == "synthetic" {
+				requestConfig.WrapperMode = "repair-only"
+				raw, fix, reason = requestConfig.Prepare(original)
+				state.learnMode = false
+			}
+			if fix != nil && fix.Synthetic() {
+				state.retryKey = makeRetryKey(r, original)
+				if cache.contains(state.retryKey, now) {
+					raw, fix, reason = original, nil, "upstream_tool_retry_suppressed"
+				} else if cache.contains(state.modelKey, now) {
+					raw, fix, reason = original, nil, "upstream_tool_retry_suppressed"
+					if cfg.WrapperMode == "adaptive" {
+						requestConfig.WrapperMode = "repair-only"
+						raw, fix, _ = requestConfig.Prepare(original)
+						state.learnMode = false
+						if fix != nil {
+							fix.Note(reason)
+						}
+					}
+				}
+			}
+			state.fix = fix
 			if fix != nil {
-				state = &chatState{fix: fix, retryKey: key}
 				if fix.Synthetic() {
 					state.original = original
 					state.acceptEncoding = r.Header.Values("Accept-Encoding")
 				}
-				r = r.WithContext(context.WithValue(r.Context(), requestKey{}, state))
+				if field != "" && policy.ceiling > 0 {
+					state.sentCap = policy.cap(state.modelKey, budget)
+					if state.sentCap != budget {
+						raw = rewriteTokenCap(raw, field, state.sentCap)
+					}
+				}
+				if fix.ForcedTool() {
+					state.forcedPayload = raw
+				}
+				state.continuation = newContinuation(continueConfig, original, budget, state.sentCap)
 			}
 			r.Body = io.NopCloser(bytes.NewReader(raw))
 			r.ContentLength = int64(len(raw))
 		}
+		r = r.WithContext(context.WithValue(r.Context(), requestKey{}, state))
 		proxy.ServeHTTP(w, r)
 	})
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -278,7 +343,7 @@ func requestState(r *http.Request) *chatState {
 }
 
 func requestFix(r *http.Request) *truncationfix.Request {
-	if state := requestState(r); state != nil && !state.retried {
+	if state := requestState(r); state != nil && !state.passthrough {
 		return state.fix
 	}
 	return nil
